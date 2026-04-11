@@ -1,0 +1,213 @@
+name: Merge OEM Overlay onto Google GKI
+
+on:
+  workflow_dispatch:
+    inputs:
+      google_branch:
+        description: 'Google GKI branch'
+        default: 'android15-6.6'
+        required: true
+      cctv18_branch:
+        description: 'cctv18 OEM branch'
+        default: 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89'
+        required: true
+      target_branch:
+        description: 'Target branch in this repo'
+        default: 'merge/android15-6.6-oplus'
+        required: true
+      dry_run:
+        description: 'Dry run (no push)'
+        type: boolean
+        default: false
+
+jobs:
+  merge:
+    name: Overlay OEM drivers onto GKI base
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Configure git
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global advice.detachedHead false
+
+      - name: Checkout this repo (for scripts)
+        uses: actions/checkout@v4
+        with:
+          path: scripts_repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone Google GKI base
+        run: |
+          git clone --depth=1 \
+            -b "${{ inputs.google_branch }}" \
+            https://android.googlesource.com/kernel/common \
+            google_src
+          echo "GOOGLE_SHA=$(git -C google_src rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Clone cctv18 OEM source
+        run: |
+          git clone --depth=1 \
+            -b "${{ inputs.cctv18_branch }}" \
+            https://github.com/cctv18/android_kernel_common_oneplus_sm8750 \
+            cctv18_src
+          echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Prepare merged repo (Google base + new branch)
+        run: |
+          cp -a google_src merged
+          cd merged
+          # Point origin at THIS repo with write token
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git checkout -b "${{ inputs.target_branch }}"
+
+      - name: Detect & copy OEM overlay
+        run: |
+          set -euo pipefail
+          SRC="$(pwd)/cctv18_src"
+          DST="$(pwd)/merged"
+          GOOGLE="$(pwd)/google_src"
+
+          # ── explicit OEM dirs ──────────────────────────────────────────────
+          OEM_DIRS=(
+            drivers/vendor/oplus
+            drivers/soc/oplus
+            drivers/gpu/drm/oplus
+            drivers/input/touchscreen/oplus_touchscreen_v2
+            drivers/misc/oplus_motor
+            sound/soc/oplus
+          )
+          OEM_TOPLEVEL=()
+          # scan cctv18 root for oem-named top-level dirs
+          for d in "$SRC"/*/; do
+            name=$(basename "$d")
+            for pat in oplus oppo oneplus coloros sm8750; do
+              if echo "$name" | grep -qi "$pat"; then
+                OEM_TOPLEVEL+=("$name"); break
+              fi
+            done
+          done
+
+          OEM_ARCH_CONFIGS=()
+          for f in \
+            arch/arm64/configs/gki_defconfig_oplus \
+            arch/arm64/configs/oplus_gki.config \
+            arch/arm64/configs/vendor/oplus \
+            arch/arm64/configs/vendor/sm8750 \
+          ; do
+            [[ -e "$SRC/$f" ]] && OEM_ARCH_CONFIGS+=("$f")
+          done
+
+          echo "=== Top-level OEM dirs: ${OEM_TOPLEVEL[*]:-none}"
+          echo "=== OEM driver dirs:    ${OEM_DIRS[*]}"
+          echo "=== OEM arch configs:   ${OEM_ARCH_CONFIGS[*]:-none}"
+
+          # ── copy ──────────────────────────────────────────────────────────
+          copy_path() {
+            local rel="$1"
+            if [[ -d "$SRC/$rel" ]]; then
+              mkdir -p "$DST/$(dirname "$rel")"
+              cp -a "$SRC/$rel" "$DST/$(dirname "$rel")/"
+            elif [[ -f "$SRC/$rel" ]]; then
+              mkdir -p "$DST/$(dirname "$rel")"
+              cp -a "$SRC/$rel" "$DST/$rel"
+            else
+              echo "  SKIP (not found in cctv18): $rel"
+            fi
+          }
+
+          for d in "${OEM_TOPLEVEL[@]}"; do copy_path "$d"; done
+          for d in "${OEM_DIRS[@]}"; do     copy_path "$d"; done
+          for f in "${OEM_ARCH_CONFIGS[@]}"; do copy_path "$f"; done
+
+          # ── auto-detect extra OEM driver dirs not in google ───────────────
+          find "$SRC/drivers" -mindepth 1 -maxdepth 3 -type d | while read -r abs; do
+            rel="${abs#$SRC/}"
+            [[ -d "$GOOGLE/$rel" ]] && continue   # exists in google, skip
+            for pat in oplus oppo oneplus coloros sm8750; do
+              if echo "$rel" | grep -qi "$pat"; then
+                echo "  Auto-copy: $rel"
+                mkdir -p "$DST/$(dirname "$rel")"
+                cp -a "$SRC/$rel" "$DST/$(dirname "$rel")/" 2>/dev/null || true
+                break
+              fi
+            done
+          done
+
+      - name: Patch drivers/Makefile and drivers/Kconfig
+        run: |
+          DST="$(pwd)/merged"
+          DRV_MK="$DST/drivers/Makefile"
+          DRV_KC="$DST/drivers/Kconfig"
+
+          if [[ -f "$DRV_MK" && -d "$DST/drivers/vendor/oplus" ]]; then
+            if ! grep -q "vendor/oplus" "$DRV_MK"; then
+              printf '\n# OEM vendor drivers\nobj-$(CONFIG_OPLUS_DRIVERS)\t+= vendor/oplus/\n' >> "$DRV_MK"
+              echo "Patched drivers/Makefile"
+            fi
+          fi
+          if [[ -f "$DRV_KC" && -f "$DST/drivers/vendor/oplus/Kconfig" ]]; then
+            if ! grep -q "vendor/oplus" "$DRV_KC"; then
+              printf '\nsource "drivers/vendor/oplus/Kconfig"\n' >> "$DRV_KC"
+              echo "Patched drivers/Kconfig"
+            fi
+          fi
+
+      - name: Commit overlay
+        run: |
+          cd merged
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "overlay: import OEM drivers from cctv18 onto Google GKI android15-6.6
+
+Google base:  ${{ inputs.google_branch }} @ ${{ env.GOOGLE_SHA }}
+OEM source:   ${{ inputs.cctv18_branch }} @ ${{ env.CCTV18_SHA }}
+
+Overlaid all oplus/oppo/oneplus/coloros/sm8750-specific drivers and configs.
+Resolve any remaining conflicts before building."
+
+      - name: Push to target branch
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          cd merged
+          git push -u origin "${{ inputs.target_branch }}" --force
+          echo "Pushed to ${{ inputs.target_branch }}"
+
+      - name: Upload merged tree as artifact (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-kernel-tree
+          path: merged/
+          retention-days: 3
+          # 6.6 tree is ~2GB — split if needed
+          if-no-files-found: error
+
+      - name: Print conflict hints
+        if: always()
+        run: |
+          echo "=== Common conflict areas to check ==="
+          for f in \
+            include/linux/sched.h \
+            fs/proc/task_mmu.c \
+            kernel/fork.c \
+            net/core/sock.c \
+            drivers/android/binder.c \
+            drivers/Makefile \
+            drivers/Kconfig \
+          ; do
+            if grep -ql '<<<<<<' "merged/$f" 2>/dev/null; then
+              echo "  CONFLICT: $f"
+            fi
+          done || true
