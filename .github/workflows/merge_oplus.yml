@@ -178,8 +178,8 @@ jobs:
       - name: Prepare target tree (fresh Google HEAD)
         run: |
           cd google_src
-          git fetch --depth=1 origin ${{ inputs.google_branch }}
-          git checkout origin/${{ inputs.google_branch }}
+          # Просто возвращаемся на свежую ветку, которую мы скачали в самом начале
+          git checkout ${{ inputs.google_branch }}
           cd ..
           cp -a google_src merged
           cd merged
