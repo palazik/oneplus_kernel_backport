@@ -163,16 +163,10 @@ jobs:
             echo "Nothing to commit."
             exit 0
           fi
-          git commit -m "overlay: import OEM drivers from cctv18 onto Google GKI android15-6.6
-
-Google base:  ${{ inputs.google_branch }} @ ${{ env.GOOGLE_SHA }}
-OEM source:   ${{ inputs.cctv18_branch }} @ ${{ env.CCTV18_SHA }}
-
-Overlaid all oplus/oppo/oneplus/coloros/sm8750-specific drivers and configs.
-Resolve any remaining conflicts before building."
+          git commit -m "overlay: import OEM drivers from cctv18 onto Google GKI android15-6.6"
 
       - name: Push to target branch
-        if: ${{ inputs.dry_run != true }}
+        if: inputs.dry_run != 'true'
         run: |
           cd merged
           git push -u origin "${{ inputs.target_branch }}" --force
