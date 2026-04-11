@@ -48,8 +48,8 @@ jobs:
 
       - name: Clone Google GKI
         run: |
-          # depth=50 to find the 6.6.89 tag which is a few commits back from HEAD
-          git clone --depth=50 \
+          # depth=200 to find the 6.6.89 tag which is a few commits back from HEAD
+          git clone --depth=200 \
             -b "${{ inputs.google_branch }}" \
             https://android.googlesource.com/kernel/common \
             google_src
@@ -63,7 +63,7 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Find fork point (6.6.89 tag in Google history)
+            - name: Find fork point (6.6.89 tag in Google history)
         run: |
           cd google_src
           # The known fork point from previous run logs
@@ -78,11 +78,6 @@ jobs:
             FORK_SHA=$(git log --format="%H %s" | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
             if [[ -n "$FORK_SHA" ]]; then
               echo "Found via grep: $FORK_SHA"
-            else
-              # Fetch more history and try again
-              git fetch --deepen=200 origin "${{ inputs.google_branch }}"
-              FORK_SHA=$(git log --format="%H %s" | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
-              echo "Found after deeper fetch: $FORK_SHA"
             fi
           fi
 
@@ -93,6 +88,7 @@ jobs:
 
           echo "FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
           git log -1 --oneline "$FORK_SHA"
+
 
       - name: Checkout Google at fork point
         run: |
