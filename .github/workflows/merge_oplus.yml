@@ -64,7 +64,6 @@ jobs:
         run: |
           cp -a google_src merged
           cd merged
-          # Point origin at THIS repo with write token
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b "${{ inputs.target_branch }}"
@@ -76,7 +75,6 @@ jobs:
           DST="$(pwd)/merged"
           GOOGLE="$(pwd)/google_src"
 
-          # ── explicit OEM dirs ──────────────────────────────────────────────
           OEM_DIRS=(
             drivers/vendor/oplus
             drivers/soc/oplus
@@ -86,7 +84,6 @@ jobs:
             sound/soc/oplus
           )
           OEM_TOPLEVEL=()
-          # scan cctv18 root for oem-named top-level dirs
           for d in "$SRC"/*/; do
             name=$(basename "$d")
             for pat in oplus oppo oneplus coloros sm8750; do
@@ -101,8 +98,7 @@ jobs:
             arch/arm64/configs/gki_defconfig_oplus \
             arch/arm64/configs/oplus_gki.config \
             arch/arm64/configs/vendor/oplus \
-            arch/arm64/configs/vendor/sm8750 \
-          ; do
+            arch/arm64/configs/vendor/sm8750; do
             [[ -e "$SRC/$f" ]] && OEM_ARCH_CONFIGS+=("$f")
           done
 
@@ -110,7 +106,6 @@ jobs:
           echo "=== OEM driver dirs:    ${OEM_DIRS[*]}"
           echo "=== OEM arch configs:   ${OEM_ARCH_CONFIGS[*]:-none}"
 
-          # ── copy ──────────────────────────────────────────────────────────
           copy_path() {
             local rel="$1"
             if [[ -d "$SRC/$rel" ]]; then
@@ -125,13 +120,12 @@ jobs:
           }
 
           for d in "${OEM_TOPLEVEL[@]}"; do copy_path "$d"; done
-          for d in "${OEM_DIRS[@]}"; do     copy_path "$d"; done
+          for d in "${OEM_DIRS[@]}"; do copy_path "$d"; done
           for f in "${OEM_ARCH_CONFIGS[@]}"; do copy_path "$f"; done
 
-          # ── auto-detect extra OEM driver dirs not in google ───────────────
           find "$SRC/drivers" -mindepth 1 -maxdepth 3 -type d | while read -r abs; do
             rel="${abs#$SRC/}"
-            [[ -d "$GOOGLE/$rel" ]] && continue   # exists in google, skip
+            [[ -d "$GOOGLE/$rel" ]] && continue
             for pat in oplus oppo oneplus coloros sm8750; do
               if echo "$rel" | grep -qi "$pat"; then
                 echo "  Auto-copy: $rel"
@@ -178,20 +172,19 @@ Overlaid all oplus/oppo/oneplus/coloros/sm8750-specific drivers and configs.
 Resolve any remaining conflicts before building."
 
       - name: Push to target branch
-        if: ${{ inputs.dry_run == false }}
+        if: ${{ inputs.dry_run != true }}
         run: |
           cd merged
           git push -u origin "${{ inputs.target_branch }}" --force
           echo "Pushed to ${{ inputs.target_branch }}"
 
-      - name: Upload merged tree as artifact (dry-run / always)
+      - name: Upload merged tree as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: merged-kernel-tree
           path: merged/
           retention-days: 3
-          # 6.6 tree is ~2GB — split if needed
           if-no-files-found: error
 
       - name: Print conflict hints
@@ -205,8 +198,7 @@ Resolve any remaining conflicts before building."
             net/core/sock.c \
             drivers/android/binder.c \
             drivers/Makefile \
-            drivers/Kconfig \
-          ; do
+            drivers/Kconfig; do
             if grep -ql '<<<<<<' "merged/$f" 2>/dev/null; then
               echo "  CONFLICT: $f"
             fi
