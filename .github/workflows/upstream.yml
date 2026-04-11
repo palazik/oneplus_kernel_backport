@@ -9,6 +9,15 @@ jobs:
     permissions:
       contents: write # Разрешаем боту пушить код в твое репо
     steps:
+      - name: Free Disk Space (Clean Workspace)
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h # Показать, сколько места освободилось
+
       - name: Setup Git
         run: |
           git config --global user.name "github-actions[bot]"
