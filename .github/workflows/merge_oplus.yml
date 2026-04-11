@@ -46,15 +46,16 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone Google GKI (depth=1)
+      - name: Clone Google GKI
         run: |
-          git clone --depth=1 \
+          # depth=50 to find the 6.6.89 tag which is a few commits back from HEAD
+          git clone --depth=50 \
             -b "${{ inputs.google_branch }}" \
             https://android.googlesource.com/kernel/common \
             google_src
           echo "GOOGLE_SHA=$(git -C google_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Clone cctv18 (depth=1)
+      - name: Clone cctv18
         run: |
           git clone --depth=1 \
             -b "${{ inputs.cctv18_branch }}" \
@@ -62,73 +63,90 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      # Find the exact Google commit that matches cctv18's base (6.6.89 tag)
-      # We need google tree AT 6.6.89, not HEAD, for a clean diff
-      - name: Checkout Google at fork point (6.6.89)
+      - name: Find fork point (6.6.89 tag in Google history)
         run: |
           cd google_src
-          # Fetch just the tag without full history
-          git fetch --depth=1 origin \
-            refs/tags/android15-6.6.89_r00:refs/tags/android15-6.6.89_r00 \
-            2>/dev/null || true
+          # The known fork point from previous run logs
+          KNOWN_SHA="9f62a273a8443aa2d97898c5c473974ec3ea77d1"
 
-          FORK_SHA=$(git log --format="%H %s" origin/${{ inputs.google_branch }} \
-            2>/dev/null | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
-
-          # If we found it in shallow log
-          if [[ -n "$FORK_SHA" ]]; then
-            git fetch --depth=1 origin "$FORK_SHA" 2>/dev/null || true
-            git checkout "$FORK_SHA" 2>/dev/null || true
-            echo "Checked out fork point: $FORK_SHA"
+          # Try to find it in our shallow clone
+          if git cat-file -e "$KNOWN_SHA" 2>/dev/null; then
+            FORK_SHA="$KNOWN_SHA"
+            echo "Found known fork point: $FORK_SHA"
           else
-            echo "WARNING: Could not find 6.6.89 in shallow log, using HEAD as base"
-            FORK_SHA=$(git rev-parse HEAD)
+            # Search by tag message in shallow log
+            FORK_SHA=$(git log --format="%H %s" | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
+            if [[ -n "$FORK_SHA" ]]; then
+              echo "Found via grep: $FORK_SHA"
+            else
+              # Fetch more history and try again
+              git fetch --deepen=200 origin "${{ inputs.google_branch }}"
+              FORK_SHA=$(git log --format="%H %s" | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
+              echo "Found after deeper fetch: $FORK_SHA"
+            fi
           fi
-          echo "FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
 
-      # Diff subtree by subtree to avoid 380MB single-file segfault
-      - name: Generate OEM patch (split by subtree)
+          if [[ -z "$FORK_SHA" ]]; then
+            echo "ERROR: Could not find 6.6.89 fork point"
+            exit 1
+          fi
+
+          echo "FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
+          git log -1 --oneline "$FORK_SHA"
+
+      - name: Checkout Google at fork point
+        run: |
+          cd google_src
+          git checkout "${{ env.FORK_SHA }}"
+
+      - name: Generate OEM patches (per subtree)
         run: |
           GOOGLE="$(pwd)/google_src"
           CCTV18="$(pwd)/cctv18_src"
+          RUNNER_WORKDIR="$(pwd)"
           mkdir -p patches
 
-          # Top-level subtrees to diff separately
-          SUBTREES=(
-            arch
-            block
-            crypto
-            drivers
-            fs
-            include
-            init
-            ipc
-            kernel
-            lib
-            mm
-            net
-            scripts
-            security
-            sound
-            tools
-            virt
-          )
+          SUBTREES=(arch block crypto drivers fs include init ipc kernel lib mm net scripts security sound tools virt)
 
-          TOTAL_SIZE=0
           for tree in "${SUBTREES[@]}"; do
             if [[ -d "$CCTV18/$tree" ]]; then
               echo "Diffing $tree/ ..."
               git diff --no-index --binary \
                 "$GOOGLE/$tree" "$CCTV18/$tree" \
                 > "patches/${tree}.patch" 2>/dev/null || true
+
+              # Fix paths: replace absolute paths with relative
+              # Handle both regular files and /dev/null (new/deleted files)
+              python3 - "$RUNNER_WORKDIR" "patches/${tree}.patch" << 'PYEOF'
+          import sys, re
+
+          workdir = sys.argv[1]
+          patch_file = sys.argv[2]
+
+          with open(patch_file, 'r', errors='replace') as f:
+              content = f.read()
+
+          # Strip workdir-based absolute paths from --- and +++ lines
+          # git diff --no-index uses full paths like:
+          #   --- a/home/runner/work/.../google_src/drivers/foo.c
+          #   +++ b/home/runner/work/.../cctv18_src/drivers/foo.c
+          content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
+          content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
+          # Also handle the reverse (deleted files show cctv18 as ---)
+          content = re.sub(r'--- a/.+?/cctv18_src/', '--- a/', content)
+          content = re.sub(r'\+\+\+ b/.+?/google_src/', '+++ b/', content)
+
+          with open(patch_file, 'w') as f:
+              f.write(content)
+          print(f"  Fixed paths in {patch_file}")
+          PYEOF
+
               SIZE=$(wc -c < "patches/${tree}.patch")
-              TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
               echo "  $tree: $SIZE bytes"
             fi
           done
 
-          # Root-level files (Makefile, Kconfig, etc.)
-          echo "Diffing root files ..."
+          # Root files
           for f in Makefile Kconfig MAINTAINERS; do
             if [[ -f "$CCTV18/$f" ]]; then
               git diff --no-index --binary \
@@ -137,25 +155,24 @@ jobs:
             fi
           done
 
-          echo "Total patch size: $TOTAL_SIZE bytes"
+          python3 - "$(pwd)" "patches/root.patch" << 'PYEOF'
+          import sys, re
+          workdir = sys.argv[1]
+          patch_file = sys.argv[2]
+          try:
+              with open(patch_file, 'r', errors='replace') as f:
+                  content = f.read()
+              content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
+              content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
+              with open(patch_file, 'w') as f:
+                  f.write(content)
+          except FileNotFoundError:
+              pass
+          PYEOF
+
+          echo "Total patches:"
           ls -lh patches/
 
-      # Fix patch paths: --no-index produces full paths, strip to relative
-      - name: Fix patch paths
-        run: |
-          for patch in patches/*.patch; do
-            [[ -s "$patch" ]] || continue
-            # Replace full paths with relative ones
-            # e.g. "--- a/home/runner/.../google_src/drivers/..." -> "--- a/drivers/..."
-            sed -i \
-              -e "s|--- a/.*/google_src/|--- a/|g" \
-              -e "s|+++ b/.*/cctv18_src/|+++ b/|g" \
-              -e "s|--- a/.*/google_src$|--- a/|g" \
-              -e "s|+++ b/.*/cctv18_src$|+++ b/|g" \
-              "$patch"
-          done
-
-      # Prepare fresh Google HEAD as target
       - name: Prepare target tree (fresh Google HEAD)
         run: |
           cd google_src
@@ -168,7 +185,6 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b "${{ inputs.target_branch }}"
 
-      # Apply each subtree patch independently
       - name: Apply patches subtree by subtree
         run: |
           cd merged
@@ -178,20 +194,16 @@ jobs:
             [[ -s "$patch" ]] || continue
             name=$(basename "$patch")
             echo "Applying $name ..."
-
             git apply \
               --reject \
               --ignore-whitespace \
               --ignore-space-change \
-              "$patch" 2>&1 | tail -5 || true
-
-            REJECTS=$(find . -name "*.rej" | wc -l)
-            echo "  rejects so far: $REJECTS"
-            TOTAL_REJECTS=$REJECTS
+              "$patch" 2>&1 | grep -v "^Checking\|^Applied" | head -5 || true
+            TOTAL_REJECTS=$(find . -name "*.rej" | wc -l)
+            echo "  rejects so far: $TOTAL_REJECTS"
           done
 
           echo "REJECT_COUNT=$TOTAL_REJECTS" >> $GITHUB_ENV
-          echo "Total rejected hunks: $TOTAL_REJECTS"
           if [[ "$TOTAL_REJECTS" -gt 0 ]]; then
             echo "=== Rejected files ==="
             find . -name "*.rej"
@@ -200,7 +212,6 @@ jobs:
       - name: Commit result
         run: |
           cd merged
-          # Remove .rej and .orig files before committing
           find . -name "*.rej" -delete
           find . -name "*.orig" -delete
           git add -A
@@ -214,9 +225,11 @@ jobs:
         if: inputs.dry_run != 'true'
         run: |
           cd merged
+          # Pack objects before push to avoid "did not receive expected object" error
+          git gc --aggressive --quiet
           git push -u origin "${{ inputs.target_branch }}" --force
 
-      - name: Upload patches
+      - name: Upload patches artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -224,7 +237,7 @@ jobs:
           path: patches/
           retention-days: 7
 
-      - name: Upload rejects
+      - name: Upload rejects artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
