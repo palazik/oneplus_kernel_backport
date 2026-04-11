@@ -103,18 +103,35 @@ jobs:
 
       - name: Generate OEM patches (per subtree)
         run: |
+          GOOGLE="$(pwd)/google_src"
+          CCTV18="$(pwd)/cctv18_src"
+          RUNNER_WORKDIR="$(pwd)"
           mkdir -p patches
 
           SUBTREES=(arch block crypto drivers fs include init ipc kernel lib mm net scripts security sound tools virt)
 
-          # Используем ОТНОСИТЕЛЬНЫЕ пути (без $(pwd))
           for tree in "${SUBTREES[@]}"; do
-            if [[ -d "cctv18_src/$tree" ]]; then
+            if [[ -d "$CCTV18/$tree" ]]; then
               echo "Diffing $tree/ ..."
               git diff --no-index --binary \
-                "google_src/$tree" "cctv18_src/$tree" \
+                "$GOOGLE/$tree" "$CCTV18/$tree" \
                 > "patches/${tree}.patch" 2>/dev/null || true
-                
+
+              # Возвращаем питоновский скрипт! Без него ломаются новые файлы от вендора
+              python3 - "$RUNNER_WORKDIR" "patches/${tree}.patch" << 'PYEOF'
+          import sys, re
+          workdir = sys.argv[1]
+          patch_file = sys.argv[2]
+          with open(patch_file, 'r', errors='replace') as f:
+              content = f.read()
+          content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
+          content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
+          content = re.sub(r'--- a/.+?/cctv18_src/', '--- a/', content)
+          content = re.sub(r'\+\+\+ b/.+?/google_src/', '+++ b/', content)
+          with open(patch_file, 'w') as f:
+              f.write(content)
+          PYEOF
+
               SIZE=$(wc -c < "patches/${tree}.patch")
               echo "  $tree: $SIZE bytes"
             fi
@@ -122,15 +139,27 @@ jobs:
 
           # Root files
           for f in Makefile Kconfig MAINTAINERS; do
-            if [[ -f "cctv18_src/$f" ]]; then
+            if [[ -f "$CCTV18/$f" ]]; then
               git diff --no-index --binary \
-                "google_src/$f" "cctv18_src/$f" \
+                "$GOOGLE/$f" "$CCTV18/$f" \
                 >> "patches/root.patch" 2>/dev/null || true
             fi
           done
 
-          echo "Total patches:"
-          ls -lh patches/
+          python3 - "$(pwd)" "patches/root.patch" << 'PYEOF'
+          import sys, re
+          workdir = sys.argv[1]
+          patch_file = sys.argv[2]
+          try:
+              with open(patch_file, 'r', errors='replace') as f:
+                  content = f.read()
+              content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
+              content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
+              with open(patch_file, 'w') as f:
+                  f.write(content)
+          except FileNotFoundError:
+              pass
+          PYEOF
 
       - name: Prepare target tree (fresh Google HEAD)
         run: |
@@ -154,9 +183,7 @@ jobs:
             name=$(basename "$patch")
             echo "Applying $name ..."
             
-            # Добавили флаг -p2, чтобы срезать a/google_src/ из патча
             git apply \
-              -p2 \
               --reject \
               --ignore-whitespace \
               --ignore-space-change \
