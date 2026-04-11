@@ -38,7 +38,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global advice.detachedHead false
 
-      - name: Checkout this repo (for scripts)
+      - name: Checkout this repo
         uses: actions/checkout@v4
         with:
           path: scripts_repo
@@ -60,7 +60,18 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Prepare merged repo (Google base + new branch)
+      - name: Dump cctv18 structure
+        run: |
+          echo "=== cctv18 root ==="
+          ls cctv18_src/
+          echo "=== cctv18 drivers/ ==="
+          ls cctv18_src/drivers/ || true
+          echo "=== cctv18 drivers/vendor/ ==="
+          ls cctv18_src/drivers/vendor/ 2>/dev/null || echo "(no drivers/vendor)"
+          echo "=== cctv18 arch/arm64/configs/ ==="
+          ls cctv18_src/arch/arm64/configs/ || true
+
+      - name: Prepare merged repo
         run: |
           cp -a google_src merged
           cd merged
@@ -68,89 +79,92 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b "${{ inputs.target_branch }}"
 
-      - name: Detect & copy OEM overlay
+      - name: Copy OEM overlay
         run: |
           set -euo pipefail
           SRC="$(pwd)/cctv18_src"
           DST="$(pwd)/merged"
           GOOGLE="$(pwd)/google_src"
+          PATTERNS="oplus oppo oneplus coloros"
 
-          OEM_DIRS=(
-            drivers/vendor/oplus
-            drivers/soc/oplus
-            drivers/gpu/drm/oplus
-            drivers/input/touchscreen/oplus_touchscreen_v2
-            drivers/misc/oplus_motor
-            sound/soc/oplus
-          )
-          OEM_TOPLEVEL=()
-          for d in "$SRC"/*/; do
-            name=$(basename "$d")
-            for pat in oplus oppo oneplus coloros sm8750; do
-              if echo "$name" | grep -qi "$pat"; then
-                OEM_TOPLEVEL+=("$name"); break
-              fi
-            done
-          done
-
-          OEM_ARCH_CONFIGS=()
-          for f in \
-            arch/arm64/configs/gki_defconfig_oplus \
-            arch/arm64/configs/oplus_gki.config \
-            arch/arm64/configs/vendor/oplus \
-            arch/arm64/configs/vendor/sm8750; do
-            [[ -e "$SRC/$f" ]] && OEM_ARCH_CONFIGS+=("$f")
-          done
-
-          echo "=== Top-level OEM dirs: ${OEM_TOPLEVEL[*]:-none}"
-          echo "=== OEM driver dirs:    ${OEM_DIRS[*]}"
-          echo "=== OEM arch configs:   ${OEM_ARCH_CONFIGS[*]:-none}"
-
-          copy_path() {
-            local rel="$1"
-            if [[ -d "$SRC/$rel" ]]; then
-              mkdir -p "$DST/$(dirname "$rel")"
-              cp -a "$SRC/$rel" "$DST/$(dirname "$rel")/"
-            elif [[ -f "$SRC/$rel" ]]; then
-              mkdir -p "$DST/$(dirname "$rel")"
-              cp -a "$SRC/$rel" "$DST/$rel"
-            else
-              echo "  SKIP (not found in cctv18): $rel"
-            fi
+          copy_dir() {
+            local src_abs="$1"
+            local rel="${src_abs#$SRC/}"
+            local dst_parent="$DST/$(dirname "$rel")"
+            mkdir -p "$dst_parent"
+            cp -a "$src_abs" "$dst_parent/"
+            echo "  copied: $rel"
           }
 
-          for d in "${OEM_TOPLEVEL[@]}"; do copy_path "$d"; done
-          for d in "${OEM_DIRS[@]}"; do copy_path "$d"; done
-          for f in "${OEM_ARCH_CONFIGS[@]}"; do copy_path "$f"; done
-
-          find "$SRC/drivers" -mindepth 1 -maxdepth 3 -type d | while read -r abs; do
-            rel="${abs#$SRC/}"
-            [[ -d "$GOOGLE/$rel" ]] && continue
-            for pat in oplus oppo oneplus coloros sm8750; do
-              if echo "$rel" | grep -qi "$pat"; then
-                echo "  Auto-copy: $rel"
-                mkdir -p "$DST/$(dirname "$rel")"
-                cp -a "$SRC/$rel" "$DST/$(dirname "$rel")/" 2>/dev/null || true
+          # 1. Top-level OEM dirs (e.g. oplus/ at repo root)
+          echo "=== Top-level ==="
+          for d in "$SRC"/*/; do
+            name=$(basename "$d")
+            for pat in $PATTERNS; do
+              if echo "$name" | grep -qi "$pat"; then
+                echo "  top-level: $name"
+                cp -a "$d" "$DST/"
                 break
               fi
             done
           done
 
-      - name: Patch drivers/Makefile and drivers/Kconfig
+          # 2. drivers/ subtree — any dir with OEM name not present in google
+          echo "=== drivers/ ==="
+          find "$SRC/drivers" -mindepth 1 -maxdepth 6 -type d | sort | while read -r abs; do
+            rel="${abs#$SRC/}"
+            [[ -d "$GOOGLE/$rel" ]] && continue
+            for pat in $PATTERNS; do
+              if echo "$rel" | grep -qi "$pat"; then
+                copy_dir "$abs"
+                break
+              fi
+            done
+          done
+
+          # 3. sound/ subtree
+          echo "=== sound/ ==="
+          if [[ -d "$SRC/sound" ]]; then
+            find "$SRC/sound" -mindepth 1 -maxdepth 6 -type d | sort | while read -r abs; do
+              rel="${abs#$SRC/}"
+              [[ -d "$GOOGLE/$rel" ]] && continue
+              for pat in $PATTERNS; do
+                if echo "$rel" | grep -qi "$pat"; then
+                  copy_dir "$abs"
+                  break
+                fi
+              done
+            done
+          fi
+
+          # 4. arch/arm64/configs — OEM-named configs
+          echo "=== arch configs ==="
+          find "$SRC/arch" \( -name "*.config" -o -name "*defconfig*" \) | while read -r f; do
+            rel="${f#$SRC/}"
+            for pat in $PATTERNS sm8750; do
+              if echo "$rel" | grep -qi "$pat"; then
+                mkdir -p "$DST/$(dirname "$rel")"
+                cp -a "$f" "$DST/$rel"
+                echo "  config: $rel"
+                break
+              fi
+            done
+          done
+
+          echo "=== Done copying OEM overlay ==="
+
+      - name: Patch drivers/Makefile and Kconfig
         run: |
           DST="$(pwd)/merged"
-          DRV_MK="$DST/drivers/Makefile"
-          DRV_KC="$DST/drivers/Kconfig"
-
-          if [[ -f "$DRV_MK" && -d "$DST/drivers/vendor/oplus" ]]; then
-            if ! grep -q "vendor/oplus" "$DRV_MK"; then
-              printf '\n# OEM vendor drivers\nobj-$(CONFIG_OPLUS_DRIVERS)\t+= vendor/oplus/\n' >> "$DRV_MK"
+          if [[ -f "$DST/drivers/Makefile" && -d "$DST/drivers/vendor/oplus" ]]; then
+            if ! grep -q "vendor/oplus" "$DST/drivers/Makefile"; then
+              printf '\n# OEM vendor drivers\nobj-$(CONFIG_OPLUS_DRIVERS)\t+= vendor/oplus/\n' >> "$DST/drivers/Makefile"
               echo "Patched drivers/Makefile"
             fi
           fi
-          if [[ -f "$DRV_KC" && -f "$DST/drivers/vendor/oplus/Kconfig" ]]; then
-            if ! grep -q "vendor/oplus" "$DRV_KC"; then
-              printf '\nsource "drivers/vendor/oplus/Kconfig"\n' >> "$DRV_KC"
+          if [[ -f "$DST/drivers/Kconfig" && -f "$DST/drivers/vendor/oplus/Kconfig" ]]; then
+            if ! grep -q "vendor/oplus" "$DST/drivers/Kconfig"; then
+              printf '\nsource "drivers/vendor/oplus/Kconfig"\n' >> "$DST/drivers/Kconfig"
               echo "Patched drivers/Kconfig"
             fi
           fi
@@ -160,7 +174,7 @@ jobs:
           cd merged
           git add -A
           if git diff --cached --quiet; then
-            echo "Nothing to commit."
+            echo "Nothing to commit — no OEM-specific paths found in cctv18."
             exit 0
           fi
           git commit -m "overlay: import OEM drivers from cctv18 onto Google GKI android15-6.6"
@@ -179,21 +193,4 @@ jobs:
           name: merged-kernel-tree
           path: merged/
           retention-days: 3
-          if-no-files-found: error
-
-      - name: Print conflict hints
-        if: always()
-        run: |
-          echo "=== Common conflict areas to check ==="
-          for f in \
-            include/linux/sched.h \
-            fs/proc/task_mmu.c \
-            kernel/fork.c \
-            net/core/sock.c \
-            drivers/android/binder.c \
-            drivers/Makefile \
-            drivers/Kconfig; do
-            if grep -ql '<<<<<<' "merged/$f" 2>/dev/null; then
-              echo "  CONFLICT: $f"
-            fi
-          done || true
+          if-no-files-found: warn
