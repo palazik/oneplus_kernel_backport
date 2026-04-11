@@ -22,6 +22,12 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global http.postBuffer 2147483648
+          # Принудительно отключаем HTTP/2 (спасает от разрывов curl 22)
+          git config --global http.version HTTP/1.1
+          # Увеличиваем лимиты времени ожидания для серверов GitHub
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 600
 
       - name: Clone OnePlus Base Kernel (OP13 Branch)
         run: |
