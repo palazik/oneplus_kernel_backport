@@ -3,12 +3,8 @@ name: Backport OEM Patches onto Google GKI
 on:
   workflow_dispatch:
     inputs:
-      google_new_branch:
-        description: 'Target Google GKI branch (fresh)'
-        default: 'android15-6.6'
-        required: true
-      google_base_tag:
-        description: 'Google ACK tag matching cctv18 base (6.6.89)'
+      google_branch:
+        description: 'Google GKI branch'
         default: 'android15-6.6'
         required: true
       cctv18_branch:
@@ -24,9 +20,12 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write
+
 jobs:
   backport:
-    name: Generate OEM patch and apply onto fresh GKI
+    name: Backport OEM patches onto fresh GKI
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -45,11 +44,17 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
         with:
-          path: scripts_repo
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Step 1: clone cctv18 (OEM kernel, based on 6.6.89) ──────────────
-      - name: Clone cctv18 OEM source
+      - name: Clone Google GKI (depth=1)
+        run: |
+          git clone --depth=1 \
+            -b "${{ inputs.google_branch }}" \
+            https://android.googlesource.com/kernel/common \
+            google_src
+          echo "GOOGLE_SHA=$(git -C google_src rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Clone cctv18 (depth=1)
         run: |
           git clone --depth=1 \
             -b "${{ inputs.cctv18_branch }}" \
@@ -57,125 +62,169 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      # ── Step 2: get the Google ACK commit that cctv18 forked from ────────
-      # cctv18 forked from Google ACK at 6.6.89 — find that exact commit
-      - name: Find cctv18 fork point in Google ACK
+      # Find the exact Google commit that matches cctv18's base (6.6.89 tag)
+      # We need google tree AT 6.6.89, not HEAD, for a clean diff
+      - name: Checkout Google at fork point (6.6.89)
         run: |
-          # Fetch full google ACK history (no depth limit — needed for fork-point)
-          git clone --filter=blob:none --no-checkout \
-            -b "${{ inputs.google_new_branch }}" \
-            https://android.googlesource.com/kernel/common \
-            google_src
-
           cd google_src
+          # Fetch just the tag without full history
+          git fetch --depth=1 origin \
+            refs/tags/android15-6.6.89_r00:refs/tags/android15-6.6.89_r00 \
+            2>/dev/null || true
 
-          # Find the commit tagged or matching 6.6.89 in Google ACK
-          FORK_SHA=$(git log --oneline --format="%H %s" | \
-            grep -m1 "6\.6\.89\|v6\.6\.89" | awk '{print $1}' || true)
+          FORK_SHA=$(git log --format="%H %s" origin/${{ inputs.google_branch }} \
+            2>/dev/null | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
 
-          if [[ -z "$FORK_SHA" ]]; then
-            echo "Could not find 6.6.89 tag by commit message, using HEAD~0 as fallback"
+          # If we found it in shallow log
+          if [[ -n "$FORK_SHA" ]]; then
+            git fetch --depth=1 origin "$FORK_SHA" 2>/dev/null || true
+            git checkout "$FORK_SHA" 2>/dev/null || true
+            echo "Checked out fork point: $FORK_SHA"
+          else
+            echo "WARNING: Could not find 6.6.89 in shallow log, using HEAD as base"
             FORK_SHA=$(git rev-parse HEAD)
           fi
+          echo "FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
 
-          echo "GOOGLE_FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
-          echo "Fork point SHA: $FORK_SHA"
-          git log -1 --oneline "$FORK_SHA" || true
+      # Diff subtree by subtree to avoid 380MB single-file segfault
+      - name: Generate OEM patch (split by subtree)
+        run: |
+          GOOGLE="$(pwd)/google_src"
+          CCTV18="$(pwd)/cctv18_src"
+          mkdir -p patches
 
-      # ── Step 3: generate OEM patch (cctv18 vs google fork point) ─────────
-      - name: Generate OEM patch
+          # Top-level subtrees to diff separately
+          SUBTREES=(
+            arch
+            block
+            crypto
+            drivers
+            fs
+            include
+            init
+            ipc
+            kernel
+            lib
+            mm
+            net
+            scripts
+            security
+            sound
+            tools
+            virt
+          )
+
+          TOTAL_SIZE=0
+          for tree in "${SUBTREES[@]}"; do
+            if [[ -d "$CCTV18/$tree" ]]; then
+              echo "Diffing $tree/ ..."
+              git diff --no-index --binary \
+                "$GOOGLE/$tree" "$CCTV18/$tree" \
+                > "patches/${tree}.patch" 2>/dev/null || true
+              SIZE=$(wc -c < "patches/${tree}.patch")
+              TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+              echo "  $tree: $SIZE bytes"
+            fi
+          done
+
+          # Root-level files (Makefile, Kconfig, etc.)
+          echo "Diffing root files ..."
+          for f in Makefile Kconfig MAINTAINERS; do
+            if [[ -f "$CCTV18/$f" ]]; then
+              git diff --no-index --binary \
+                "$GOOGLE/$f" "$CCTV18/$f" \
+                >> "patches/root.patch" 2>/dev/null || true
+            fi
+          done
+
+          echo "Total patch size: $TOTAL_SIZE bytes"
+          ls -lh patches/
+
+      # Fix patch paths: --no-index produces full paths, strip to relative
+      - name: Fix patch paths
+        run: |
+          for patch in patches/*.patch; do
+            [[ -s "$patch" ]] || continue
+            # Replace full paths with relative ones
+            # e.g. "--- a/home/runner/.../google_src/drivers/..." -> "--- a/drivers/..."
+            sed -i \
+              -e "s|--- a/.*/google_src/|--- a/|g" \
+              -e "s|+++ b/.*/cctv18_src/|+++ b/|g" \
+              -e "s|--- a/.*/google_src$|--- a/|g" \
+              -e "s|+++ b/.*/cctv18_src$|+++ b/|g" \
+              "$patch"
+          done
+
+      # Prepare fresh Google HEAD as target
+      - name: Prepare target tree (fresh Google HEAD)
         run: |
           cd google_src
-          git checkout "${{ env.GOOGLE_FORK_SHA }}"
+          git fetch --depth=1 origin ${{ inputs.google_branch }}
+          git checkout origin/${{ inputs.google_branch }}
           cd ..
-
-          echo "Generating diff: google@6.6.89 → cctv18 ..."
-          git diff \
-            --no-index \
-            --binary \
-            google_src/ cctv18_src/ > oem_overlay.patch || true
-          # git diff --no-index returns exit 1 when files differ — that's normal
-
-          PATCH_SIZE=$(wc -c < oem_overlay.patch)
-          PATCH_LINES=$(wc -l < oem_overlay.patch)
-          echo "Patch size: $PATCH_SIZE bytes, $PATCH_LINES lines"
-
-          if [[ "$PATCH_SIZE" -lt 1000 ]]; then
-            echo "ERROR: patch is suspiciously small — something went wrong"
-            exit 1
-          fi
-
-      # ── Step 4: prepare fresh Google GKI tree ────────────────────────────
-      - name: Checkout fresh Google GKI HEAD
-        run: |
-          cd google_src
-          git checkout "${{ inputs.google_new_branch }}" 2>/dev/null || \
-            git checkout "origin/${{ inputs.google_new_branch }}"
-          echo "GOOGLE_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          git log -1 --oneline
-
-      - name: Copy fresh GKI as merge target
-        run: |
           cp -a google_src merged
           cd merged
           git remote set-url origin \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b "${{ inputs.target_branch }}"
 
-      # ── Step 5: apply OEM patch with 3-way merge ─────────────────────────
-      - name: Apply OEM patch (3-way)
+      # Apply each subtree patch independently
+      - name: Apply patches subtree by subtree
         run: |
-          # Fix patch paths: git diff --no-index produces a/ b/ prefixes with full paths
-          # Need to strip the google_src/ and cctv18_src/ prefixes
-          sed -i \
-            -e 's|^--- a/google_src/|--- a/|g' \
-            -e 's|^+++ b/cctv18_src/|+++ b/|g' \
-            oem_overlay.patch
-
           cd merged
+          TOTAL_REJECTS=0
 
-          echo "Applying OEM patch with --3way ..."
-          git apply --3way --whitespace=nowarn ../oem_overlay.patch 2>&1 | tee /tmp/apply_log.txt || true
+          for patch in ../patches/*.patch; do
+            [[ -s "$patch" ]] || continue
+            name=$(basename "$patch")
+            echo "Applying $name ..."
 
-          # Count rejects
-          REJECTS=$(find . -name "*.rej" | wc -l)
-          echo "REJECT_COUNT=$REJECTS" >> $GITHUB_ENV
-          echo "Rejected hunks: $REJECTS"
+            git apply \
+              --reject \
+              --ignore-whitespace \
+              --ignore-space-change \
+              "$patch" 2>&1 | tail -5 || true
 
-          if [[ "$REJECTS" -gt 0 ]]; then
+            REJECTS=$(find . -name "*.rej" | wc -l)
+            echo "  rejects so far: $REJECTS"
+            TOTAL_REJECTS=$REJECTS
+          done
+
+          echo "REJECT_COUNT=$TOTAL_REJECTS" >> $GITHUB_ENV
+          echo "Total rejected hunks: $TOTAL_REJECTS"
+          if [[ "$TOTAL_REJECTS" -gt 0 ]]; then
             echo "=== Rejected files ==="
-            find . -name "*.rej" | head -50
+            find . -name "*.rej"
           fi
 
-      # ── Step 6: commit result ─────────────────────────────────────────────
-      - name: Commit backport result
+      - name: Commit result
         run: |
           cd merged
+          # Remove .rej and .orig files before committing
+          find . -name "*.rej" -delete
+          find . -name "*.orig" -delete
           git add -A
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             exit 0
           fi
-          git commit -m "backport: apply OEM patches from cctv18 onto Google GKI android15-6.6"
+          git commit -m "backport: OEM patches from cctv18 onto Google GKI ${{ inputs.google_branch }}"
 
-      # ── Step 7: push ───────────────────────────────────────────────────────
-      - name: Push to target branch
+      - name: Push
         if: inputs.dry_run != 'true'
         run: |
           cd merged
           git push -u origin "${{ inputs.target_branch }}" --force
-          echo "Pushed to ${{ inputs.target_branch }}"
 
-      # ── Step 8: upload artifacts ──────────────────────────────────────────
-      - name: Upload patch file
+      - name: Upload patches
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oem-overlay-patch
-          path: oem_overlay.patch
+          name: oem-patches
+          path: patches/
           retention-days: 7
 
-      - name: Upload reject files (if any)
+      - name: Upload rejects
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -187,15 +236,8 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "=== Backport Summary ==="
-          echo "Google base (fork point): ${{ env.GOOGLE_FORK_SHA }}"
-          echo "Google HEAD:              ${{ env.GOOGLE_SHA }}"
-          echo "cctv18 SHA:               ${{ env.CCTV18_SHA }}"
-          echo "Rejected hunks:           ${{ env.REJECT_COUNT }}"
-          echo ""
-          if [[ "${{ env.REJECT_COUNT }}" -gt 0 ]]; then
-            echo "ACTION REQUIRED: Download 'patch-rejects' artifact and resolve .rej files manually."
-            echo "These are files where Google changed the same code that OnePlus patched."
-          else
-            echo "Clean apply — no manual intervention needed."
-          fi
+          echo "=== Summary ==="
+          echo "Fork point:  ${{ env.FORK_SHA }}"
+          echo "Google HEAD: ${{ env.GOOGLE_SHA }}"
+          echo "cctv18:      ${{ env.CCTV18_SHA }}"
+          echo "Rejects:     ${{ env.REJECT_COUNT }}"
