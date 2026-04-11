@@ -1,10 +1,14 @@
-name: Merge OEM Overlay onto Google GKI
+name: Backport OEM Patches onto Google GKI
 
 on:
   workflow_dispatch:
     inputs:
-      google_branch:
-        description: 'Google GKI branch'
+      google_new_branch:
+        description: 'Target Google GKI branch (fresh)'
+        default: 'android15-6.6'
+        required: true
+      google_base_tag:
+        description: 'Google ACK tag matching cctv18 base (6.6.89)'
         default: 'android15-6.6'
         required: true
       cctv18_branch:
@@ -12,8 +16,8 @@ on:
         default: 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89'
         required: true
       target_branch:
-        description: 'Target branch in this repo'
-        default: 'merge/android15-6.6-oplus'
+        description: 'Output branch in this repo'
+        default: 'backport/android15-6.6-oplus'
         required: true
       dry_run:
         description: 'Dry run (no push)'
@@ -21,10 +25,10 @@ on:
         default: false
 
 jobs:
-  merge:
-    name: Overlay OEM drivers onto GKI base
+  backport:
+    name: Generate OEM patch and apply onto fresh GKI
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Free disk space
@@ -44,14 +48,7 @@ jobs:
           path: scripts_repo
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone Google GKI base
-        run: |
-          git clone --depth=1 \
-            -b "${{ inputs.google_branch }}" \
-            https://android.googlesource.com/kernel/common \
-            google_src
-          echo "GOOGLE_SHA=$(git -C google_src rev-parse --short HEAD)" >> $GITHUB_ENV
-
+      # ── Step 1: clone cctv18 (OEM kernel, based on 6.6.89) ──────────────
       - name: Clone cctv18 OEM source
         run: |
           git clone --depth=1 \
@@ -60,18 +57,64 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Dump cctv18 structure
+      # ── Step 2: get the Google ACK commit that cctv18 forked from ────────
+      # cctv18 forked from Google ACK at 6.6.89 — find that exact commit
+      - name: Find cctv18 fork point in Google ACK
         run: |
-          echo "=== cctv18 root ==="
-          ls cctv18_src/
-          echo "=== cctv18 drivers/ ==="
-          ls cctv18_src/drivers/ || true
-          echo "=== cctv18 drivers/vendor/ ==="
-          ls cctv18_src/drivers/vendor/ 2>/dev/null || echo "(no drivers/vendor)"
-          echo "=== cctv18 arch/arm64/configs/ ==="
-          ls cctv18_src/arch/arm64/configs/ || true
+          # Fetch full google ACK history (no depth limit — needed for fork-point)
+          git clone --filter=blob:none --no-checkout \
+            -b "${{ inputs.google_new_branch }}" \
+            https://android.googlesource.com/kernel/common \
+            google_src
 
-      - name: Prepare merged repo
+          cd google_src
+
+          # Find the commit tagged or matching 6.6.89 in Google ACK
+          FORK_SHA=$(git log --oneline --format="%H %s" | \
+            grep -m1 "6\.6\.89\|v6\.6\.89" | awk '{print $1}' || true)
+
+          if [[ -z "$FORK_SHA" ]]; then
+            echo "Could not find 6.6.89 tag by commit message, using HEAD~0 as fallback"
+            FORK_SHA=$(git rev-parse HEAD)
+          fi
+
+          echo "GOOGLE_FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
+          echo "Fork point SHA: $FORK_SHA"
+          git log -1 --oneline "$FORK_SHA" || true
+
+      # ── Step 3: generate OEM patch (cctv18 vs google fork point) ─────────
+      - name: Generate OEM patch
+        run: |
+          cd google_src
+          git checkout "${{ env.GOOGLE_FORK_SHA }}"
+          cd ..
+
+          echo "Generating diff: google@6.6.89 → cctv18 ..."
+          git diff \
+            --no-index \
+            --binary \
+            google_src/ cctv18_src/ > oem_overlay.patch || true
+          # git diff --no-index returns exit 1 when files differ — that's normal
+
+          PATCH_SIZE=$(wc -c < oem_overlay.patch)
+          PATCH_LINES=$(wc -l < oem_overlay.patch)
+          echo "Patch size: $PATCH_SIZE bytes, $PATCH_LINES lines"
+
+          if [[ "$PATCH_SIZE" -lt 1000 ]]; then
+            echo "ERROR: patch is suspiciously small — something went wrong"
+            exit 1
+          fi
+
+      # ── Step 4: prepare fresh Google GKI tree ────────────────────────────
+      - name: Checkout fresh Google GKI HEAD
+        run: |
+          cd google_src
+          git checkout "${{ inputs.google_new_branch }}" 2>/dev/null || \
+            git checkout "origin/${{ inputs.google_new_branch }}"
+          echo "GOOGLE_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          git log -1 --oneline
+
+      - name: Copy fresh GKI as merge target
         run: |
           cp -a google_src merged
           cd merged
@@ -79,106 +122,43 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -b "${{ inputs.target_branch }}"
 
-      - name: Copy OEM overlay
+      # ── Step 5: apply OEM patch with 3-way merge ─────────────────────────
+      - name: Apply OEM patch (3-way)
         run: |
-          set -euo pipefail
-          SRC="$(pwd)/cctv18_src"
-          DST="$(pwd)/merged"
-          GOOGLE="$(pwd)/google_src"
-          PATTERNS="oplus oppo oneplus coloros"
+          # Fix patch paths: git diff --no-index produces a/ b/ prefixes with full paths
+          # Need to strip the google_src/ and cctv18_src/ prefixes
+          sed -i \
+            -e 's|^--- a/google_src/|--- a/|g' \
+            -e 's|^+++ b/cctv18_src/|+++ b/|g' \
+            oem_overlay.patch
 
-          copy_dir() {
-            local src_abs="$1"
-            local rel="${src_abs#$SRC/}"
-            local dst_parent="$DST/$(dirname "$rel")"
-            mkdir -p "$dst_parent"
-            cp -a "$src_abs" "$dst_parent/"
-            echo "  copied: $rel"
-          }
+          cd merged
 
-          # 1. Top-level OEM dirs (e.g. oplus/ at repo root)
-          echo "=== Top-level ==="
-          for d in "$SRC"/*/; do
-            name=$(basename "$d")
-            for pat in $PATTERNS; do
-              if echo "$name" | grep -qi "$pat"; then
-                echo "  top-level: $name"
-                cp -a "$d" "$DST/"
-                break
-              fi
-            done
-          done
+          echo "Applying OEM patch with --3way ..."
+          git apply --3way --whitespace=nowarn ../oem_overlay.patch 2>&1 | tee /tmp/apply_log.txt || true
 
-          # 2. drivers/ subtree — any dir with OEM name not present in google
-          echo "=== drivers/ ==="
-          find "$SRC/drivers" -mindepth 1 -maxdepth 6 -type d | sort | while read -r abs; do
-            rel="${abs#$SRC/}"
-            [[ -d "$GOOGLE/$rel" ]] && continue
-            for pat in $PATTERNS; do
-              if echo "$rel" | grep -qi "$pat"; then
-                copy_dir "$abs"
-                break
-              fi
-            done
-          done
+          # Count rejects
+          REJECTS=$(find . -name "*.rej" | wc -l)
+          echo "REJECT_COUNT=$REJECTS" >> $GITHUB_ENV
+          echo "Rejected hunks: $REJECTS"
 
-          # 3. sound/ subtree
-          echo "=== sound/ ==="
-          if [[ -d "$SRC/sound" ]]; then
-            find "$SRC/sound" -mindepth 1 -maxdepth 6 -type d | sort | while read -r abs; do
-              rel="${abs#$SRC/}"
-              [[ -d "$GOOGLE/$rel" ]] && continue
-              for pat in $PATTERNS; do
-                if echo "$rel" | grep -qi "$pat"; then
-                  copy_dir "$abs"
-                  break
-                fi
-              done
-            done
+          if [[ "$REJECTS" -gt 0 ]]; then
+            echo "=== Rejected files ==="
+            find . -name "*.rej" | head -50
           fi
 
-          # 4. arch/arm64/configs — OEM-named configs
-          echo "=== arch configs ==="
-          find "$SRC/arch" \( -name "*.config" -o -name "*defconfig*" \) | while read -r f; do
-            rel="${f#$SRC/}"
-            for pat in $PATTERNS sm8750; do
-              if echo "$rel" | grep -qi "$pat"; then
-                mkdir -p "$DST/$(dirname "$rel")"
-                cp -a "$f" "$DST/$rel"
-                echo "  config: $rel"
-                break
-              fi
-            done
-          done
-
-          echo "=== Done copying OEM overlay ==="
-
-      - name: Patch drivers/Makefile and Kconfig
-        run: |
-          DST="$(pwd)/merged"
-          if [[ -f "$DST/drivers/Makefile" && -d "$DST/drivers/vendor/oplus" ]]; then
-            if ! grep -q "vendor/oplus" "$DST/drivers/Makefile"; then
-              printf '\n# OEM vendor drivers\nobj-$(CONFIG_OPLUS_DRIVERS)\t+= vendor/oplus/\n' >> "$DST/drivers/Makefile"
-              echo "Patched drivers/Makefile"
-            fi
-          fi
-          if [[ -f "$DST/drivers/Kconfig" && -f "$DST/drivers/vendor/oplus/Kconfig" ]]; then
-            if ! grep -q "vendor/oplus" "$DST/drivers/Kconfig"; then
-              printf '\nsource "drivers/vendor/oplus/Kconfig"\n' >> "$DST/drivers/Kconfig"
-              echo "Patched drivers/Kconfig"
-            fi
-          fi
-
-      - name: Commit overlay
+      # ── Step 6: commit result ─────────────────────────────────────────────
+      - name: Commit backport result
         run: |
           cd merged
           git add -A
           if git diff --cached --quiet; then
-            echo "Nothing to commit — no OEM-specific paths found in cctv18."
+            echo "Nothing to commit."
             exit 0
           fi
-          git commit -m "overlay: import OEM drivers from cctv18 onto Google GKI android15-6.6"
+          git commit -m "backport: apply OEM patches from cctv18 onto Google GKI android15-6.6"
 
+      # ── Step 7: push ───────────────────────────────────────────────────────
       - name: Push to target branch
         if: inputs.dry_run != 'true'
         run: |
@@ -186,11 +166,36 @@ jobs:
           git push -u origin "${{ inputs.target_branch }}" --force
           echo "Pushed to ${{ inputs.target_branch }}"
 
-      - name: Upload merged tree as artifact
+      # ── Step 8: upload artifacts ──────────────────────────────────────────
+      - name: Upload patch file
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: merged-kernel-tree
-          path: merged/
-          retention-days: 3
-          if-no-files-found: warn
+          name: oem-overlay-patch
+          path: oem_overlay.patch
+          retention-days: 7
+
+      - name: Upload reject files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects
+          path: merged/**/*.rej
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Backport Summary ==="
+          echo "Google base (fork point): ${{ env.GOOGLE_FORK_SHA }}"
+          echo "Google HEAD:              ${{ env.GOOGLE_SHA }}"
+          echo "cctv18 SHA:               ${{ env.CCTV18_SHA }}"
+          echo "Rejected hunks:           ${{ env.REJECT_COUNT }}"
+          echo ""
+          if [[ "${{ env.REJECT_COUNT }}" -gt 0 ]]; then
+            echo "ACTION REQUIRED: Download 'patch-rejects' artifact and resolve .rej files manually."
+            echo "These are files where Google changed the same code that OnePlus patched."
+          else
+            echo "Clean apply — no manual intervention needed."
+          fi
