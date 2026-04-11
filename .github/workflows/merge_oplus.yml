@@ -63,7 +63,7 @@ jobs:
             cctv18_src
           echo "CCTV18_SHA=$(git -C cctv18_src rev-parse --short HEAD)" >> $GITHUB_ENV
 
-            - name: Find fork point (6.6.89 tag in Google history)
+      - name: Find fork point (6.6.89 tag in Google history)
         run: |
           cd google_src
           # The known fork point from previous run logs
