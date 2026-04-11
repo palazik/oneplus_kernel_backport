@@ -103,46 +103,18 @@ jobs:
 
       - name: Generate OEM patches (per subtree)
         run: |
-          GOOGLE="$(pwd)/google_src"
-          CCTV18="$(pwd)/cctv18_src"
-          RUNNER_WORKDIR="$(pwd)"
           mkdir -p patches
 
           SUBTREES=(arch block crypto drivers fs include init ipc kernel lib mm net scripts security sound tools virt)
 
+          # Используем ОТНОСИТЕЛЬНЫЕ пути (без $(pwd))
           for tree in "${SUBTREES[@]}"; do
-            if [[ -d "$CCTV18/$tree" ]]; then
+            if [[ -d "cctv18_src/$tree" ]]; then
               echo "Diffing $tree/ ..."
               git diff --no-index --binary \
-                "$GOOGLE/$tree" "$CCTV18/$tree" \
+                "google_src/$tree" "cctv18_src/$tree" \
                 > "patches/${tree}.patch" 2>/dev/null || true
-
-              # Fix paths: replace absolute paths with relative
-              # Handle both regular files and /dev/null (new/deleted files)
-              python3 - "$RUNNER_WORKDIR" "patches/${tree}.patch" << 'PYEOF'
-          import sys, re
-
-          workdir = sys.argv[1]
-          patch_file = sys.argv[2]
-
-          with open(patch_file, 'r', errors='replace') as f:
-              content = f.read()
-
-          # Strip workdir-based absolute paths from --- and +++ lines
-          # git diff --no-index uses full paths like:
-          #   --- a/home/runner/work/.../google_src/drivers/foo.c
-          #   +++ b/home/runner/work/.../cctv18_src/drivers/foo.c
-          content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
-          content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
-          # Also handle the reverse (deleted files show cctv18 as ---)
-          content = re.sub(r'--- a/.+?/cctv18_src/', '--- a/', content)
-          content = re.sub(r'\+\+\+ b/.+?/google_src/', '+++ b/', content)
-
-          with open(patch_file, 'w') as f:
-              f.write(content)
-          print(f"  Fixed paths in {patch_file}")
-          PYEOF
-
+                
               SIZE=$(wc -c < "patches/${tree}.patch")
               echo "  $tree: $SIZE bytes"
             fi
@@ -150,27 +122,12 @@ jobs:
 
           # Root files
           for f in Makefile Kconfig MAINTAINERS; do
-            if [[ -f "$CCTV18/$f" ]]; then
+            if [[ -f "cctv18_src/$f" ]]; then
               git diff --no-index --binary \
-                "$GOOGLE/$f" "$CCTV18/$f" \
+                "google_src/$f" "cctv18_src/$f" \
                 >> "patches/root.patch" 2>/dev/null || true
             fi
           done
-
-          python3 - "$(pwd)" "patches/root.patch" << 'PYEOF'
-          import sys, re
-          workdir = sys.argv[1]
-          patch_file = sys.argv[2]
-          try:
-              with open(patch_file, 'r', errors='replace') as f:
-                  content = f.read()
-              content = re.sub(r'--- a/.+?/google_src/', '--- a/', content)
-              content = re.sub(r'\+\+\+ b/.+?/cctv18_src/', '+++ b/', content)
-              with open(patch_file, 'w') as f:
-                  f.write(content)
-          except FileNotFoundError:
-              pass
-          PYEOF
 
           echo "Total patches:"
           ls -lh patches/
@@ -196,11 +153,15 @@ jobs:
             [[ -s "$patch" ]] || continue
             name=$(basename "$patch")
             echo "Applying $name ..."
+            
+            # Добавили флаг -p2, чтобы срезать a/google_src/ из патча
             git apply \
+              -p2 \
               --reject \
               --ignore-whitespace \
               --ignore-space-change \
               "$patch" 2>&1 | grep -v "^Checking\|^Applied" | head -5 || true
+              
             TOTAL_REJECTS=$(find . -name "*.rej" | wc -l)
             echo "  rejects so far: $TOTAL_REJECTS"
           done
