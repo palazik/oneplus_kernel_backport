@@ -66,29 +66,35 @@ jobs:
       - name: Find fork point (6.6.89 tag in Google history)
         run: |
           cd google_src
-          # The known fork point from previous run logs
           KNOWN_SHA="9f62a273a8443aa2d97898c5c473974ec3ea77d1"
 
-          # Try to find it in our shallow clone
+          # 1. Проверяем, есть ли он уже у нас локально
           if git cat-file -e "$KNOWN_SHA" 2>/dev/null; then
             FORK_SHA="$KNOWN_SHA"
-            echo "Found known fork point: $FORK_SHA"
+            echo "Found known fork point locally: $FORK_SHA"
           else
-            # Search by tag message in shallow log
-            FORK_SHA=$(git log --format="%H %s" | grep -m1 "6\.6\.89" | awk '{print $1}' || true)
-            if [[ -n "$FORK_SHA" ]]; then
-              echo "Found via grep: $FORK_SHA"
+            echo "Commit not found in shallow clone. Fetching tag directly..."
+            # 2. Скачиваем конкретный тег 6.6.89 напрямую с серверов Google
+            git fetch --depth=1 origin refs/tags/android15-6.6.89_r00:refs/tags/android15-6.6.89_r00 2>/dev/null || true
+            FORK_SHA=$(git rev-list -n 1 refs/tags/android15-6.6.89_r00 2>/dev/null || true)
+            
+            if [[ -z "$FORK_SHA" ]]; then
+              echo "Tag fetch failed. Trying to fetch exact SHA..."
+              # 3. Резервный вариант: тянем по хешу
+              git fetch --depth=1 origin "$KNOWN_SHA" 2>/dev/null || true
+              if git cat-file -e "$KNOWN_SHA" 2>/dev/null; then
+                FORK_SHA="$KNOWN_SHA"
+              fi
             fi
           fi
 
           if [[ -z "$FORK_SHA" ]]; then
-            echo "ERROR: Could not find 6.6.89 fork point"
+            echo "ERROR: Could not find or fetch 6.6.89 fork point"
             exit 1
           fi
 
           echo "FORK_SHA=$FORK_SHA" >> $GITHUB_ENV
           git log -1 --oneline "$FORK_SHA"
-
 
       - name: Checkout Google at fork point
         run: |
