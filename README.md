@@ -1,2 +1,2 @@
 # OnePlus_Kernel_Backport
-Porting newest Google's A15 kernel to OnePlus 13
+Manual porting newest Google's A15 kernel to OnePlus 13
