@@ -1029,12 +1029,7 @@ try_to_free:
 		}
 
 		folio_unqueue_deferred_split(folio);
-		if (folio_test_lru(folio)) {
-			lruvec = folio_lruvec_relock_irqsave(folio, lruvec,
-									&flags);
-			lruvec_del_folio(lruvec, folio);
-			__folio_clear_lru_flags(folio);
-		}
+		__page_cache_release(folio, &lruvec, &flags);
 
 		if (j != i)
 			folios->folios[j] = folio;
