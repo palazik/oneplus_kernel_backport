@@ -1196,13 +1196,14 @@ void dpu_encoder_virt_runtime_resume(struct drm_encoder *drm_enc)
 out:
 	mutex_unlock(&dpu_enc->enc_lock);
 }
-
 static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
 					struct drm_atomic_state *state)
 {
 	struct dpu_encoder_virt *dpu_enc = NULL;
 	int ret = 0;
 	struct drm_display_mode *cur_mode = NULL;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
 
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
 
@@ -1218,6 +1219,16 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
 
 	trace_dpu_enc_enable(DRMID(drm_enc), cur_mode->hdisplay,
 			     cur_mode->vdisplay);
+
+	crtc = drm_atomic_get_new_crtc_for_encoder(state, drm_enc);
+	if (crtc) {
+		old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
+		if (old_crtc_state && old_crtc_state->self_refresh_active) {
+			_dpu_encoder_virt_enable_helper(drm_enc);
+			dpu_enc->enabled = true;
+			goto out;
+		}
+	}
 
 	/* always enable slave encoder before master */
 	if (dpu_enc->cur_slave && dpu_enc->cur_slave->ops.enable)
