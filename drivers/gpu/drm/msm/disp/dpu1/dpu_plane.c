@@ -834,9 +834,9 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
 	r_pipe->sspp = NULL;
 
 	pstate->stage = DPU_STAGE_0 + pstate->base.normalized_zpos;
-	if (pstate->stage > pdpu->catalog->caps->max_mixer_blendstages) {
+	if (pstate->stage >= pdpu->catalog->caps->max_mixer_blendstages) {
 		DPU_ERROR("> %d plane stages assigned\n",
-			  pdpu->catalog->caps->max_mixer_blendstages);
+			  pdpu->catalog->caps->max_mixer_blendstages - DPU_STAGE_0);
 		return -EINVAL;
 	}
 
