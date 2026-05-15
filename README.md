@@ -1,2 +1,2 @@
-# OnePlus_Kernel_Backport
-Upstreaming newest Google's 6.6 A15 kernel to OnePlus 13
+# OnePlus_Kernel_Upstream
+Upstreaming OnePlus 13's kernel to the Google's newest 6.6
